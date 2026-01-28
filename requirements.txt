@@ -1,4 +1,2 @@
-flask
-flask-sockets
-gevent
-gevent-websocket
+fastapi
+uvicorn[standard]
