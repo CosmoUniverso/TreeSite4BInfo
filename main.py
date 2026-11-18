@@ -51,10 +51,14 @@ async def client_ws(ws: WebSocket):
         print("PC disconnesso")
 
     finally:
-        connected_clients.pop(CLIENT_ID, None)
-        future = pending_responses.get(CLIENT_ID)
-        if future and not future.done():
-            future.set_exception(RuntimeError("PC disconnesso durante l'elaborazione"))
+        if connected_clients.get(CLIENT_ID) is ws:
+            connected_clients.pop(CLIENT_ID, None)
+
+            future = pending_responses.get(CLIENT_ID)
+            if future and not future.done():
+                future.set_exception(
+                    RuntimeError("PC disconnesso durante l'elaborazione")
+                )
 
 
 @app.post("/api/chat")
