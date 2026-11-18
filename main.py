@@ -19,8 +19,12 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-MAX_QUEUED = int(os.getenv("VIVO_MAX_QUEUED", "24"))
-EXEC_TIMEOUT = int(os.getenv("VIVO_EXEC_TIMEOUT", "105"))
+# Practical response deadline, not an unlimited backlog. Incoming requests are
+# rejected quickly when they cannot reasonably fit inside the latency budget.
+MAX_QUEUED = int(os.getenv("VIVO_MAX_QUEUED", "2"))
+EXEC_TIMEOUT = min(27.0, float(os.getenv("VIVO_EXEC_TIMEOUT", "27")))
+ADMISSION_LIMIT = min(26.0, float(os.getenv("VIVO_ADMISSION_LIMIT", "24")))
+ESTIMATED_SECONDS = float(os.getenv("VIVO_ESTIMATED_SECONDS", "10"))
 RESULT_TTL = int(os.getenv("VIVO_RESULT_TTL", "900"))
 MAX_PROMPT_CHARS = int(os.getenv("VIVO_MAX_PROMPT_CHARS", "800"))
 ORIGINS = [v.strip() for v in os.getenv(
@@ -36,6 +40,8 @@ class Job:
     response: str = ""
     error: str = ""
     completed_at: float | None = None
+    deadline_at: float = 0.0
+    started_at: float = 0.0
     result: asyncio.Future = field(default=None, repr=False)  # type: ignore
     completion: asyncio.Future = field(default=None, repr=False)  # type: ignore
 
@@ -44,6 +50,9 @@ jobs: dict[str, Job] = {}
 active_id: str | None = None
 client_ws: WebSocket | None = None
 worker_task: asyncio.Task | None = None
+# EWMA is updated from real completed requests, so admission follows measured
+# throughput rather than allowing a 24-person, many-minute queue.
+avg_duration = ESTIMATED_SECONDS
 
 
 def _close_job(job: Job, status: str, response: str = "", error: str = "") -> None:
@@ -53,6 +62,15 @@ def _close_job(job: Job, status: str, response: str = "", error: str = "") -> No
     job.completed_at = time.monotonic()
     if job.completion and not job.completion.done():
         job.completion.set_result(None)
+
+
+def _predicted_seconds() -> float:
+    """Expected completion time for a newly submitted request."""
+    now = time.monotonic()
+    current = jobs.get(active_id) if active_id else None
+    elapsed = (now - current.started_at) if current else 0.0
+    remaining = max(2.0, avg_duration - elapsed) if current else 0.0
+    return remaining + queue.qsize() * avg_duration + avg_duration
 
 
 def _cleanup() -> None:
@@ -90,29 +108,42 @@ def _view(job: Job) -> dict[str, Any]:
 
 
 async def _worker() -> None:
-    global active_id
+    global active_id, avg_duration
     while True:
         job = await queue.get()
         active_id = job.id
         job.status = "running"
+        job.started_at = time.monotonic()
         try:
+            remaining = job.deadline_at - time.monotonic()
+            if remaining <= 1.0:
+                _close_job(job, "error", error="Tempo di attesa esaurito; riprova")
+                continue
             ws = client_ws
             if ws is None:
                 _close_job(job, "error", error="PC non collegato")
                 continue
             await ws.send_text(json.dumps({
-                "type": "task", "task_id": job.id, "prompt": job.prompt
+                "type": "task", "task_id": job.id, "prompt": job.prompt,
+                "budget_seconds": max(1.0, job.deadline_at - time.monotonic())
             }, ensure_ascii=False))
             # Exactly one task is sent at a time. Legacy client results lacking an ID
             # remain unambiguous because of this serialization.
-            reply = await asyncio.wait_for(job.result, timeout=EXEC_TIMEOUT)
+            reply = await asyncio.wait_for(
+                job.result, timeout=max(.1, min(EXEC_TIMEOUT, job.deadline_at - time.monotonic()))
+            )
+            if time.monotonic() > job.deadline_at:
+                _close_job(job, "error", error="Risposta arrivata fuori tempo massimo")
+                continue
             text = reply.get("response")
-            if not isinstance(text, str) or not text.strip():
-                _close_job(job, "error", error="Il modello ha restituito una risposta vuota")
-            elif reply.get("error"):
+            if reply.get("error"):
                 _close_job(job, "error", error=str(reply["error"])[:300])
+            elif not isinstance(text, str) or not text.strip():
+                _close_job(job, "error", error="Risposta incompleta o vuota")
             else:
                 _close_job(job, "done", response=text)
+                duration = time.monotonic() - job.started_at
+                avg_duration = max(4.0, min(24.0, avg_duration * .75 + duration * .25))
         except asyncio.TimeoutError:
             _close_job(job, "error", error="Tempo di elaborazione superato")
         except Exception as exc:
@@ -149,6 +180,8 @@ async def status():
         "connected": client_ws is not None,
         "queued": queue.qsize(),
         "running": active_id is not None,
+        "estimated_seconds": round(avg_duration, 1),
+        "deadline_seconds": EXEC_TIMEOUT,
     }
 
 
@@ -196,10 +229,13 @@ async def chat(payload: dict):
     if client_ws is None:
         raise HTTPException(status_code=503, detail="PC offline")
     if queue.full() or queue.qsize() >= MAX_QUEUED:
-        raise HTTPException(status_code=429, detail="Coda piena: riprova fra poco")
+        raise HTTPException(status_code=429, detail="Vivo è occupato: riprova tra pochi secondi")
+    if _predicted_seconds() > ADMISSION_LIMIT:
+        raise HTTPException(status_code=429, detail="Coda troppo lunga per rispondere in tempo: riprova tra poco")
 
     loop = asyncio.get_running_loop()
     job = Job(id=uuid.uuid4().hex, prompt=prompt.strip())
+    job.deadline_at = job.created_at + EXEC_TIMEOUT
     job.result = loop.create_future()
     job.completion = loop.create_future()
     jobs[job.id] = job
@@ -211,7 +247,7 @@ async def chat(payload: dict):
 
     # Legacy compatibility for deployed clients that only expect {response}.
     try:
-        await asyncio.wait_for(asyncio.shield(job.completion), timeout=EXEC_TIMEOUT + 10)
+        await asyncio.wait_for(asyncio.shield(job.completion), timeout=EXEC_TIMEOUT + 1)
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Attesa del relay scaduta. Usa async_mode")
     if job.status == "done":
